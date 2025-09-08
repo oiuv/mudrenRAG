@@ -1,0 +1,20 @@
+# Environment variables
+.env
+
+# Generated data
+/data/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE-specific
+.idea/
+.vscode/
+
+# Virtual environments
+venv/
+.venv/
+env/
