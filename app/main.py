@@ -68,8 +68,8 @@ def startup_event():
     print("--- Server startup complete! ---")
 
 
-@app.post("/retrieval", 
-          response_model=RetrievalResponse, 
+@app.post("/retrieval",
+          response_model=RetrievalResponse,
           responses={403: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
 async def retrieval(request: RetrievalRequest, authorization: str = Header(None)):
     """Main endpoint for Dify to retrieve knowledge."""
@@ -103,7 +103,7 @@ async def retrieval(request: RetrievalRequest, authorization: str = Header(None)
         for i, dist in zip(indices[0], distances[0]):
             # Convert L2 distance to a 0-1 similarity score (a common approach)
             score = 1.0 / (1.0 + dist)
-            
+
             if score < request.retrieval_setting.score_threshold:
                 continue
 
@@ -125,7 +125,7 @@ async def retrieval(request: RetrievalRequest, authorization: str = Header(None)
                     metadata={
                         "thread_id": thread_id,
                         "url": f"https://bbs.mud.ren/threads/{thread_id}",
-                        "user_name": thread_data.get('user', {}).get('name', 'Unknown'),
+                        "author": thread_data.get('user', {}).get('name', 'Unknown'),
                         "published_at": thread_data.get('published_at', None)
                     }
                 )

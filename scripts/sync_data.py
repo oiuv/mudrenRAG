@@ -1,4 +1,3 @@
-
 import os
 import json
 import numpy as np
@@ -9,8 +8,8 @@ from dotenv import load_dotenv
 
 # --- Configuration ---
 load_dotenv()
-BATCH_SIZE = 10  # Batch size for calling the embedding API (max allowed by DashScope is 10)
-EMBEDDING_DIMENSION = 1024  # Dimension of the embeddings
+BATCH_SIZE = 10
+EMBEDDING_DIMENSION = 1024
 FAISS_INDEX_PATH = "data/threads.index"
 ID_MAPPING_PATH = "data/id_mapping.json"
 
@@ -23,97 +22,92 @@ client = OpenAI(
 def get_db_connection():
     """Establishes connection to the MySQL database."""
     try:
-        print("--- Debugging Connection Info ---")
-        db_host = os.getenv("DB_HOST")
-        db_port = os.getenv("DB_PORT")
-        db_user = os.getenv("DB_USER")
-        db_name = os.getenv("DB_NAME")
-        print(f"  - Host: {db_host}")
-        print(f"  - Port: {db_port}")
-        print(f"  - User: {db_user}")
-        print(f"  - Database: {db_name}")
-        print("---------------------------------")
-
         conn = mysql.connector.connect(
-            host=db_host,
-            port=db_port,
-            user=db_user,
+            host=os.getenv("DB_HOST"),
+            port=os.getenv("DB_PORT"),
+            user=os.getenv("DB_USER"),
             password=os.getenv("DB_PASSWORD"),
-            database=db_name
+            database=os.getenv("DB_NAME")
         )
-        
-        # Verify the current database
-        test_cursor = conn.cursor()
-        test_cursor.execute("SELECT DATABASE();")
-        current_db = test_cursor.fetchone()
-        print(f"Successfully connected. Current database in use: '{current_db[0] if current_db else 'NOT FOUND'}'")
-        test_cursor.close()
-        
         return conn
     except mysql.connector.Error as e:
         print(f"Error connecting to MySQL Database: {e}")
         exit(1)
 
-def fetch_threads():
-    """Fetches all threads from the database."""
-    print("Connecting to the database...")
+def main():
+    """Main function to run the data synchronization and vectorization."""
+    print("--- Starting Data Synchronization ---")
+
+    faiss_index = None
+    id_mapping = {}
+    max_id = 0
+
+    # Step 1: Try to load existing data to determine the update mode
+    try:
+        print("Checking for existing data...")
+        faiss_index = faiss.read_index(FAISS_INDEX_PATH)
+        with open(ID_MAPPING_PATH, 'r') as f:
+            # JSON keys are strings, convert them back to int for mapping
+            id_mapping = {int(k): v for k, v in json.load(f).items()}
+
+        if id_mapping:
+            max_id = max(id_mapping.values())
+
+        print(f"Found existing data. Last thread ID is {max_id}. Starting INCREMENTAL update.")
+
+    except FileNotFoundError:
+        print("No existing data found. Starting FULL rebuild.")
+        faiss_index = faiss.IndexFlatL2(EMBEDDING_DIMENSION)
+        id_mapping = {}
+
+    # Step 2: Fetch new threads from the database
     conn = get_db_connection()
     cursor = conn.cursor()
-    
-    # The value is 'App\Thread', which needs to be escaped as 'App\\Thread' in a Python string.
-    query = """
+
+    base_query = """
     SELECT t.id, t.title, c.markdown
     FROM threads AS t
     JOIN contents AS c ON t.id = c.contentable_id
-    WHERE t.deleted_at IS NULL 
-      AND t.banned_at IS NULL
-      AND c.contentable_type = 'App\\\\Thread';
+    WHERE t.deleted_at IS NULL AND t.banned_at IS NULL AND c.contentable_type = 'App\\\\Thread'
     """
-    
-    print("Executing query to fetch threads...")
+
+    if max_id > 0:
+        query = base_query + f" AND t.id > {max_id}"
+    else:
+        query = base_query
+
+    print(f"Executing query to fetch new threads (ID > {max_id})...")
     cursor.execute(query)
-    threads = cursor.fetchall()
-    
+    new_threads = cursor.fetchall()
     cursor.close()
     conn.close()
-    print(f"Found {len(threads)} threads to process.")
-    return threads
 
+    if not new_threads:
+        print("No new threads found. Knowledge base is up to date.")
+        print("--- Synchronization Process Finished Successfully! ---")
+        return
 
-def create_embeddings(threads):
-    """Creates embeddings for all threads using DashScope API."""
-    if not threads:
-        print("No threads to embed.")
-        return np.array([]), {}
+    print(f"Found {len(new_threads)} new threads to process.")
 
+    # Step 3: Prepare texts and create embeddings for new threads
     texts_to_embed = []
-    thread_ids = []
+    new_thread_ids = []
     max_len = 8192
 
-    print("Preparing and validating texts for embedding...")
-    for id, title, markdown in threads:
-        # Combine title and content
+    for id, title, markdown in new_threads:
         text = f"标题：{title}\n内容：{markdown}"
-        
-        # Truncate if text is too long
         if len(text) > max_len:
-            print(f"  - [WARN] Thread ID {id} is too long ({len(text)} chars). Truncating to {max_len} chars.")
             text = text[:max_len]
-        
-        # Skip if text is empty
         if not text.strip():
-            print(f"  - [WARN] Thread ID {id} is empty. Skipping.")
             continue
-        
         texts_to_embed.append(text)
-        thread_ids.append(id)
+        new_thread_ids.append(id)
 
-    all_embeddings = []
-    print(f"Starting to create embeddings for {len(texts_to_embed)} valid threads in batches of {BATCH_SIZE}...")
+    all_new_embeddings = []
+    print(f"Starting to create embeddings for {len(texts_to_embed)} valid new threads...")
 
     for i in range(0, len(texts_to_embed), BATCH_SIZE):
         batch_texts = texts_to_embed[i:i + BATCH_SIZE]
-        
         try:
             response = client.embeddings.create(
                 model="text-embedding-v4",
@@ -121,44 +115,33 @@ def create_embeddings(threads):
                 dimensions=EMBEDDING_DIMENSION
             )
             batch_embeddings = [item.embedding for item in response.data]
-            all_embeddings.extend(batch_embeddings)
-            print(f"  - Processed batch {i//BATCH_SIZE + 1}/{-(-len(texts_to_embed)//BATCH_SIZE)} ({len(all_embeddings)} embeddings total)")
+            all_new_embeddings.extend(batch_embeddings)
+            print(f"  - Processed batch {i//BATCH_SIZE + 1}/{-(-len(texts_to_embed)//BATCH_SIZE)}")
         except Exception as e:
             print(f"An error occurred during embedding creation for batch {i}: {e}")
-            # Optional: decide if you want to stop or continue
             continue
-            
-    # Create a mapping from FAISS index (0, 1, 2...) to thread_id
-    id_mapping = {i: thread_ids[i] for i in range(len(all_embeddings))}
-    
-    return np.array(all_embeddings, dtype='float32'), id_mapping
 
-def build_and_save_index(embeddings, id_mapping):
-    """Builds a FAISS index and saves it to disk."""
-    if embeddings.shape[0] == 0:
-        print("No embeddings were created. Skipping index creation.")
+    if not all_new_embeddings:
+        print("No new embeddings were created. Exiting.")
         return
 
-    print(f"Building FAISS index with {embeddings.shape[0]} vectors of dimension {embeddings.shape[1]}...")
-    index = faiss.IndexFlatL2(EMBEDDING_DIMENSION)
-    index.add(embeddings)
-    
-    # Create data directory if it doesn't exist
+    # Step 4: Add new vectors to index and update mapping
+    start_index = faiss_index.ntotal
+    new_embeddings_np = np.array(all_new_embeddings, dtype='float32')
+    faiss_index.add(new_embeddings_np)
+
+    for i, thread_id in enumerate(new_thread_ids):
+        id_mapping[start_index + i] = thread_id
+
+    # Step 5: Save updated data to disk
     os.makedirs(os.path.dirname(FAISS_INDEX_PATH), exist_ok=True)
-    
-    print(f"Saving FAISS index to {FAISS_INDEX_PATH}")
-    faiss.write_index(index, FAISS_INDEX_PATH)
-    
-    print(f"Saving ID mapping to {ID_MAPPING_PATH}")
+    print(f"Saving FAISS index with a total of {faiss_index.ntotal} vectors...")
+    faiss.write_index(faiss_index, FAISS_INDEX_PATH)
+
+    print("Saving ID mapping...")
     with open(ID_MAPPING_PATH, 'w') as f:
         json.dump(id_mapping, f)
 
-def main():
-    """Main function to run the data synchronization and vectorization."""
-    print("--- Starting Data Synchronization and Vectorization ---")
-    threads = fetch_threads()
-    embeddings, id_mapping = create_embeddings(threads)
-    build_and_save_index(embeddings, id_mapping)
     print("--- Synchronization Process Finished Successfully! ---")
 
 if __name__ == "__main__":
