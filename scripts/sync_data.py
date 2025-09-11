@@ -55,7 +55,7 @@ def main():
 
         print(f"Found existing data. Last thread ID is {max_id}. Starting INCREMENTAL update.")
 
-    except FileNotFoundError:
+    except (FileNotFoundError, RuntimeError):
         print("No existing data found. Starting FULL rebuild.")
         faiss_index = faiss.IndexFlatL2(EMBEDDING_DIMENSION)
         id_mapping = {}
