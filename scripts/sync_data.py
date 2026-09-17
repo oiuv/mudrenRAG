@@ -1,148 +1,156 @@
-import os
+"""Synchronize visible forum threads; publish only after every batch succeeds."""
+import argparse
+import hashlib
 import json
-import numpy as np
+import logging
+import os
+import sys
+from itertools import islice
+from pathlib import Path
+
+# Preserve the documented "python scripts/sync_data.py" entry point.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import faiss
 import mysql.connector
+import numpy as np
+from filelock import FileLock, Timeout
 from openai import OpenAI
-from dotenv import load_dotenv
 
-# --- Configuration ---
-load_dotenv()
+from app.config import EMBEDDING_DIMENSION, EMBEDDING_MODEL, MAX_TEXT_LENGTH, Settings
+from app.index_store import SNAPSHOT_NAME, Snapshot, load_snapshot, save_snapshot
+
+logger = logging.getLogger(__name__)
 BATCH_SIZE = 10
-EMBEDDING_DIMENSION = 1024
-FAISS_INDEX_PATH = "data/threads.index"
-ID_MAPPING_PATH = "data/id_mapping.json"
 
-# --- Initialize DashScope Client ---
-client = OpenAI(
-    api_key=os.getenv("DASHSCOPE_API_KEY"),
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
-)
 
 def get_db_connection():
-    """Establishes connection to the MySQL database."""
+    return mysql.connector.connect(
+        host=os.getenv("DB_HOST"),
+        port=int(os.getenv("DB_PORT", "3306")),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        database=os.getenv("DB_NAME"),
+        connection_timeout=15,
+    )
+
+
+def iter_threads(connection):
+    cursor = connection.cursor()
     try:
-        conn = mysql.connector.connect(
-            host=os.getenv("DB_HOST"),
-            port=os.getenv("DB_PORT"),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
-            database=os.getenv("DB_NAME")
+        cursor.execute(
+            "SELECT t.id, t.title, c.markdown "
+            "FROM threads AS t JOIN contents AS c ON t.id = c.contentable_id "
+            "WHERE t.deleted_at IS NULL AND t.banned_at IS NULL "
+            "AND c.contentable_type = %s ORDER BY t.id",
+            ("App\\Thread",),
         )
-        return conn
-    except mysql.connector.Error as e:
-        print(f"Error connecting to MySQL Database: {e}")
-        exit(1)
+        while rows := cursor.fetchmany(100):
+            yield from rows
+    finally:
+        cursor.close()
+
+
+def build_snapshot(rows, client, previous: Snapshot | None = None) -> Snapshot:
+    """Reuse unchanged vectors while reflecting edits, deletions and unbans."""
+    old_positions = {
+        entry["thread_id"]: (position, entry.get("source_hash"))
+        for position, entry in enumerate(previous.entries)
+    } if previous is not None else {}
+    index = faiss.IndexFlatL2(EMBEDDING_DIMENSION)
+    entries = []
+    seen = set()
+    iterator = iter(rows)
+    while batch := list(islice(iterator, BATCH_SIZE)):
+        prepared = []
+        for thread_id, title, markdown in batch:
+            if type(thread_id) is not int or thread_id <= 0 or thread_id in seen:
+                raise ValueError(f"Invalid or duplicate thread ID: {thread_id}")
+            seen.add(thread_id)
+            title, markdown = title or "", markdown or ""
+            if not title.strip() and not markdown.strip():
+                continue
+            digest = hashlib.sha256(
+                json.dumps([title, markdown], ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            prepared.append((thread_id, digest, f"标题：{title}\n内容：{markdown}"[:MAX_TEXT_LENGTH]))
+        if not prepared:
+            continue
+        vectors = [None] * len(prepared)
+        changed = []
+        for position, (thread_id, digest, text) in enumerate(prepared):
+            old = old_positions.get(thread_id)
+            if old is not None and old[1] == digest:
+                vectors[position] = previous.index.reconstruct(old[0])
+            else:
+                changed.append((position, text))
+        if changed:
+            response = client.embeddings.create(
+                model=EMBEDDING_MODEL, input=[text for _, text in changed],
+                dimensions=EMBEDDING_DIMENSION,
+            )
+            # The provider may return items out of order. Bind by response.index.
+            items = sorted(response.data, key=lambda item: item.index)
+            if [item.index for item in items] != list(range(len(changed))):
+                raise ValueError("Embedding response count or indices do not match the requested batch.")
+            for (position, _), item in zip(changed, items):
+                vectors[position] = item.embedding
+        array = np.asarray(vectors, dtype=np.float32)
+        if array.shape != (len(prepared), EMBEDDING_DIMENSION) or not np.isfinite(array).all():
+            raise ValueError("Embedding response contains invalid vectors.")
+        index.add(array)
+        entries.extend({"thread_id": thread_id, "source_hash": digest} for thread_id, digest, _ in prepared)
+        logger.info("Processed %s threads (%s embeddings generated in this batch).", len(entries), len(changed))
+    return Snapshot(index, entries)
+
+
+def synchronize(settings: Settings, full: bool = False):
+    if not settings.dashscope_api_key:
+        raise ValueError("DASHSCOPE_API_KEY must be configured.")
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(settings.data_dir / ".sync.lock"), timeout=0):
+        previous = None
+        has_snapshot = (settings.data_dir / SNAPSHOT_NAME).exists()
+        has_legacy = all((settings.data_dir / name).exists() for name in ("threads.index", "id_mapping.json"))
+        if not full and (has_snapshot or has_legacy):
+            # Corrupt existing data must be explicitly rebuilt, never silently replaced.
+            previous = load_snapshot(settings.data_dir)
+        connection = get_db_connection()
+        rows = iter_threads(connection)
+        try:
+            with OpenAI(
+                api_key=settings.dashscope_api_key,
+                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                timeout=30.0, max_retries=2,
+            ) as client:
+                snapshot = build_snapshot(rows, client, previous)
+        finally:
+            try:
+                rows.close()
+            finally:
+                connection.close()
+        if previous is not None and snapshot.entries == previous.entries and has_snapshot:
+            logger.info("No content changes; existing snapshot retained.")
+            return
+        save_snapshot(settings.data_dir, snapshot)
+        logger.info("Published %s threads to %s.", snapshot.index.ntotal, settings.data_dir / SNAPSHOT_NAME)
+
 
 def main():
-    """Main function to run the data synchronization and vectorization."""
-    print("--- Starting Data Synchronization ---")
-
-    faiss_index = None
-    id_mapping = {}
-    max_id = 0
-
-    # Step 1: Try to load existing data to determine the update mode
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--full", action="store_true", help="Rebuild all vectors without reusing existing data.")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:
-        print("Checking for existing data...")
-        faiss_index = faiss.read_index(FAISS_INDEX_PATH)
-        with open(ID_MAPPING_PATH, 'r') as f:
-            # JSON keys are strings, convert them back to int for mapping
-            id_mapping = {int(k): v for k, v in json.load(f).items()}
+        synchronize(Settings.from_env(), full=args.full)
+    except Timeout:
+        logger.error("Another synchronization is running; no index was changed.")
+        return 1
+    except Exception:
+        logger.exception("Synchronization failed; the previously published snapshot was not replaced.")
+        return 1
+    return 0
 
-        if id_mapping:
-            max_id = max(id_mapping.values())
-
-        print(f"Found existing data. Last thread ID is {max_id}. Starting INCREMENTAL update.")
-
-    except (FileNotFoundError, RuntimeError):
-        print("No existing data found. Starting FULL rebuild.")
-        faiss_index = faiss.IndexFlatL2(EMBEDDING_DIMENSION)
-        id_mapping = {}
-
-    # Step 2: Fetch new threads from the database
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    base_query = """
-    SELECT t.id, t.title, c.markdown
-    FROM threads AS t
-    JOIN contents AS c ON t.id = c.contentable_id
-    WHERE t.deleted_at IS NULL AND t.banned_at IS NULL AND c.contentable_type = 'App\\\\Thread'
-    """
-
-    if max_id > 0:
-        query = base_query + f" AND t.id > {max_id}"
-    else:
-        query = base_query
-
-    print(f"Executing query to fetch new threads (ID > {max_id})...")
-    cursor.execute(query)
-    new_threads = cursor.fetchall()
-    cursor.close()
-    conn.close()
-
-    if not new_threads:
-        print("No new threads found. Knowledge base is up to date.")
-        print("--- Synchronization Process Finished Successfully! ---")
-        return
-
-    print(f"Found {len(new_threads)} new threads to process.")
-
-    # Step 3: Prepare texts and create embeddings for new threads
-    texts_to_embed = []
-    new_thread_ids = []
-    max_len = 8192
-
-    for id, title, markdown in new_threads:
-        text = f"标题：{title}\n内容：{markdown}"
-        if len(text) > max_len:
-            text = text[:max_len]
-        if not text.strip():
-            continue
-        texts_to_embed.append(text)
-        new_thread_ids.append(id)
-
-    all_new_embeddings = []
-    print(f"Starting to create embeddings for {len(texts_to_embed)} valid new threads...")
-
-    for i in range(0, len(texts_to_embed), BATCH_SIZE):
-        batch_texts = texts_to_embed[i:i + BATCH_SIZE]
-        try:
-            response = client.embeddings.create(
-                model="text-embedding-v4",
-                input=batch_texts,
-                dimensions=EMBEDDING_DIMENSION
-            )
-            batch_embeddings = [item.embedding for item in response.data]
-            all_new_embeddings.extend(batch_embeddings)
-            print(f"  - Processed batch {i//BATCH_SIZE + 1}/{-(-len(texts_to_embed)//BATCH_SIZE)}")
-        except Exception as e:
-            print(f"An error occurred during embedding creation for batch {i}: {e}")
-            continue
-
-    if not all_new_embeddings:
-        print("No new embeddings were created. Exiting.")
-        return
-
-    # Step 4: Add new vectors to index and update mapping
-    start_index = faiss_index.ntotal
-    new_embeddings_np = np.array(all_new_embeddings, dtype='float32')
-    faiss_index.add(new_embeddings_np)
-
-    for i, thread_id in enumerate(new_thread_ids):
-        id_mapping[start_index + i] = thread_id
-
-    # Step 5: Save updated data to disk
-    os.makedirs(os.path.dirname(FAISS_INDEX_PATH), exist_ok=True)
-    print(f"Saving FAISS index with a total of {faiss_index.ntotal} vectors...")
-    faiss.write_index(faiss_index, FAISS_INDEX_PATH)
-
-    print("Saving ID mapping...")
-    with open(ID_MAPPING_PATH, 'w') as f:
-        json.dump(id_mapping, f)
-
-    print("--- Synchronization Process Finished Successfully! ---")
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

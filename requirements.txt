@@ -1,7 +1,10 @@
-fastapi
-uvicorn
-mysql-connector-python
-openai
-python-dotenv
-faiss-cpu
-httpx
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+mysql-connector-python>=9,<27
+openai>=1.30,<4
+python-dotenv>=1,<2
+faiss-cpu>=1.8,<2
+numpy>=1.26,<3
+httpx>=0.27,<1
+pydantic>=2.7,<3
+filelock>=3.13,<4

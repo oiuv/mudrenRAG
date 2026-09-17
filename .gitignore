@@ -1,20 +1,19 @@
-# Environment variables
+# Credentials and generated data
 .env
-
-# Generated data
 /data/
 
-# Python cache
+# Python caches and test output
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
+.coverage
+htmlcov/
 
-# IDE-specific
+# IDE settings and virtual environments
 .idea/
 .vscode/
-
-# Virtual environments
 venv/
 .venv/
 env/
