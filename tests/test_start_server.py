@@ -36,7 +36,7 @@ def stage(command):
         return "install"
     if "check" in command:
         return "pip_check"
-    if "uvicorn" in command:
+    if "app.server" in command:
         return "serve"
     if any(item.endswith("sync_data.py") for item in command):
         return "sync"
@@ -127,7 +127,7 @@ def test_interrupt_stops_startup(project, monkeypatch):
 @pytest.fixture
 def configuration(project, monkeypatch):
     root, _ = project
-    for key in (*startup.REQUIRED_ENV, "DB_PASSWORD", "DB_PORT"):
+    for key in (*startup.REQUIRED_ENV, "DB_PASSWORD", "DB_PORT", "HOST", "PORT"):
         monkeypatch.delenv(key, raising=False)
     (root / ".env.example").write_text(
         (REPOSITORY / ".env.example").read_text(encoding="utf-8"), encoding="utf-8",
@@ -214,3 +214,11 @@ def test_batch_handles_spaces_unicode_and_propagates_exit_status(tmp_path, exist
     assert Path(data["cwd"]) == root
     if existing_venv:
         assert Path(data["prefix"]) == root / ".venv"
+
+
+@pytest.mark.parametrize("key, value", [("HOST", "http://localhost"), ("PORT", "65536")])
+def test_invalid_listener_is_rejected_before_sync(configuration, monkeypatch, key, value):
+    set_valid_environment(monkeypatch)
+    monkeypatch.setenv(key, value)
+    with pytest.raises(ValueError, match=key):
+        startup.validate_configuration()

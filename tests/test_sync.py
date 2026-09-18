@@ -209,3 +209,78 @@ def test_empty_database_publishes_empty_lexical_corpus():
     result = sync.build_snapshot([], client)
     assert result.keyword_tokens == []
     assert result.keyword_index.search("anything", 10) == []
+
+
+def test_duplicate_zero_indices_retry_individually_without_assuming_order(monkeypatch):
+    monkeypatch.setattr(sync, "BATCH_SIZE", 2)
+    client, calls = embedding_client()
+    original_create = client.embeddings.create.side_effect
+    def create(**kwargs):
+        result = original_create(**kwargs)
+        if len(kwargs["input"]) > 1:
+            for item in result.data:
+                item.index = 0
+        return result
+    client.embeddings.create.side_effect = create
+    result = sync.build_snapshot([(i, str(i), "content") for i in range(1, 5)], client)
+    # The ambiguous batch was reversed; none of its positions may be trusted.
+    assert [len(texts) for texts in calls] == [2, 1, 1, 1, 1]
+    for position in range(4):
+        np.testing.assert_array_equal(result.index.reconstruct(position), vector(position + 1))
+
+
+def test_invalid_single_retry_keeps_published_snapshot(tmp_path, monkeypatch):
+    settings = Settings("dify", "model", tmp_path)
+    save_snapshot(tmp_path, snapshot((99,)))
+    before = (tmp_path / SNAPSHOT_NAME).read_bytes()
+    client = Mock()
+    client.__enter__ = Mock(return_value=client)
+    client.__exit__ = Mock(return_value=False)
+    client.embeddings.create.side_effect = [
+        NS(data=[NS(index=0, embedding=vector(2)), NS(index=0, embedding=vector(1))]),
+        NS(data=[NS(index=1, embedding=vector(1))]),
+    ]
+    monkeypatch.setattr(sync, "get_db_connection", Mock())
+    monkeypatch.setattr(sync, "iter_threads", lambda connection: iter_rows())
+    monkeypatch.setattr(sync, "OpenAI", lambda **kwargs: client)
+    def iter_rows():
+        yield (1, "1", "text")
+        yield (2, "2", "text")
+    with pytest.raises(ValueError, match="Single-text"):
+        sync.synchronize(settings)
+    assert (tmp_path / SNAPSHOT_NAME).read_bytes() == before
+
+
+def test_interrupted_stream_can_close_with_unread_mysql_rows():
+    connection = Mock()
+    cursor = connection.cursor.return_value
+    cursor.fetchmany.return_value = [(1, "1", "text"), (2, "2", "text")]
+    cursor.close.side_effect = sync.mysql.connector.InternalError("Unread result found")
+    rows = sync.iter_threads(connection)
+    assert next(rows) == (1, "1", "text")
+    rows.close()
+    cursor.close.assert_called_once()
+
+
+def test_cleanup_preserves_original_embedding_error(tmp_path, monkeypatch):
+    settings = Settings("dify", "model", tmp_path)
+    connection = Mock()
+    cursor = connection.cursor.return_value
+    cursor.fetchmany.return_value = [(i, str(i), "text") for i in range(1, 20)]
+    cursor.close.side_effect = sync.mysql.connector.InternalError("Unread result found")
+    client, _ = embedding_client(fail_on=1)
+    monkeypatch.setattr(sync, "get_db_connection", lambda: connection)
+    monkeypatch.setattr(sync, "OpenAI", lambda **kwargs: client)
+    with pytest.raises(RuntimeError, match="failed embedding"):
+        sync.synchronize(settings)
+    connection.close.assert_called_once()
+    assert not (tmp_path / SNAPSHOT_NAME).exists()
+
+
+def test_normal_stream_close_error_is_not_hidden():
+    connection = Mock()
+    cursor = connection.cursor.return_value
+    cursor.fetchmany.return_value = []
+    cursor.close.side_effect = sync.mysql.connector.InternalError("unexpected close failure")
+    with pytest.raises(sync.mysql.connector.InternalError, match="unexpected close failure"):
+        list(sync.iter_threads(connection))

@@ -77,7 +77,9 @@ def validate_configuration():
 
     load_dotenv(env_file)
     from app.config import Settings
+    from app.server_config import ServerSettings
 
+    ServerSettings.from_env()
     Settings.from_env()
     invalid = [
         name for name in REQUIRED_ENV
@@ -108,9 +110,9 @@ def main(argv: list[str] | None = None) -> int:
             "from scripts.start_server import validate_configuration; validate_configuration()",
         ], "配置校验")
         run_step([str(python), "-u", str(PROJECT_ROOT / "scripts" / "sync_data.py")], "知识库同步")
-        print("[4/4] 正在启动 API：http://127.0.0.1:8008（监听 0.0.0.0）。按 Ctrl+C 停止。", flush=True)
+        print("[4/4] 正在按 HOST、PORT 配置启动 API……", flush=True)
         return subprocess.run([
-            str(python), "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8008",
+            str(python), "-m", "app.server",
         ], cwd=PROJECT_ROOT).returncode
     except (StartupError, OSError) as exc:
         print(f"[错误] {exc}", file=sys.stderr, flush=True)

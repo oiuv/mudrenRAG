@@ -30,6 +30,8 @@ python -m pip install -r requirements.txt
 
 | 配置 | 说明 |
 | --- | --- |
+| HOST | API 监听地址，默认 0.0.0.0；仅本机访问时设置 127.0.0.1，支持 IPv6 |
+| PORT | API 监听端口，默认 8008，范围 1–65535 |
 | DIFY_API_KEY | Dify 请求此服务使用的密钥 |
 | DASHSCOPE_API_KEY | 阿里云 DashScope 密钥，向量和重排共用 |
 | EMBEDDING_MODEL | 向量模型，默认 qwen3.7-text-embedding-flash |
@@ -61,8 +63,10 @@ python -m pip install -r requirements.txt
 
 ```bash
 python scripts/sync_data.py
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8008
+python -m app.server
 ```
+
+`python -m app.server` 自动读取项目 `.env` 中的 `HOST`、`PORT`，缺省监听 `0.0.0.0:8008`；不会安装依赖或同步数据。直接使用 Uvicorn 命令行时，需自行传入 `--host` / `--port`，不会自动采用这两个项目配置项。
 
 ### Windows 自动启动
 
@@ -77,7 +81,7 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8008
 1. 优先使用项目 `.venv`；不存在时选择 Python（优先 3.12）并创建虚拟环境。
 2. 补齐 pip，按 `requirements.txt` 安装缺失或版本不符合要求的包，随后检查依赖兼容性。已满足要求的版本保留，不执行全量升级或强制重装。
 3. 校验配置并运行一次普通增量同步，向量与 BM25 数据一起更新。
-4. 同步成功后启动 Uvicorn，监听 `0.0.0.0:8008`。
+4. 同步成功后启动 Uvicorn，按 `.env` 的 `HOST`、`PORT` 监听（默认 `0.0.0.0:8008`）。
 
 首次缺少 `.env` 且进程环境变量配置不完整时，会从中文注释的 `.env.example` 创建模板并停止；填写密钥与数据库配置后再次运行即可。已有 `.env` 保留。完全通过环境变量配置时无需创建 `.env`。数据库密码允许为空，但模板中的占位值需替换。
 
@@ -91,15 +95,17 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8008
 
 在 Dify 中配置：
 
-- API 端点：`http://<服务器IP>:8008`，不附加 `/retrieval`。
+- API 端点：`http://<服务器IP>:<PORT>`，默认端口 8008，不附加 `/retrieval`。`0.0.0.0` 是监听地址，Dify 应填写能访问的实际服务器地址。
 - API 密钥：`DIFY_API_KEY`。
 - 外部知识库 ID：与 `KNOWLEDGE_ID` 一致。
 
 ## 同步、升级与恢复
 
+交互式召回测试运行 `.venv\Scripts\python.exe scripts/query_knowledge.py`，自动读取 `.env` 密钥；使用 `--top-k 5 --score 0.5` 调整参数，`-q "中文问题"` 执行单次查询。
+
 可直接照着操作的 Windows 任务计划、Linux cron、接口自测与错误码说明见 [同步与接口排查操作指南](docs/operations.md)。
 
-新版使用 `data/knowledge.npz` 保存 FAISS 索引、BM25 分词数据及分词器版本、帖子映射、内容指纹和向量模型名称及维度。每次同步遍历数据库当前未删除、未封禁的帖子，数据库扫描量与帖子总量有关，但只为变更内容生成向量。同步进程使用文件锁，避免同时发布多个更新。
+新版使用 `data/knowledge.npz` 保存 FAISS 索引、BM25 分词数据及分词器版本、帖子映射、内容指纹和向量模型名称及维度。每次同步遍历数据库当前未删除、未封禁的帖子，数据库扫描量与帖子总量有关，但只为变更内容生成向量。同步进程使用文件锁，避免同时发布多个更新。若向量兼容接口把批量结果的序号全部返回为 0，脚本会丢弃无法确认对应关系的批量结果，逐条重试并在本轮后续同步中使用单条请求；首批会额外调用一次向量接口，确保帖子与向量不会错配。
 
 升级到混合检索时，在项目虚拟环境中执行：
 
@@ -167,19 +173,21 @@ python scripts/sync_data.py --full
 
 ## 正文接口故障
 
-HTTPS 证书校验始终启用。证书过期、网络超时或接口数据异常会记录帖子 ID 和失败原因；没有可返回结果时，Dify 会收到 HTTP 502 / error_code 5003，而不会误显示为正常无命中。部分正文获取成功时可返回部分结果；404/410 帖子会跳过。
+HTTPS 证书校验始终启用。证书过期、网络超时或接口数据异常会记录帖子 ID 和失败原因；没有可返回结果时，Dify 会收到 HTTP 502 / error_code 5003，而不会误显示为正常无命中。部分正文获取成功时可返回部分结果；404/410 帖子会跳过。论坛接口返回 429 时，本次检索返回 HTTP 503 / error_code 5006，并携带 `Retry-After`；进程会按上游要求进入冷却期（缺少有效等待时间时默认 60 秒），停止继续遍历候选，冷却期内的新查询也不会调用向量或正文接口。并发上限不等于每分钟配额，连续检索仍需遵守论坛 API 的限流规则。
 
 若域名经过 WAF，检查运行服务的机器实际连接到的地址，以及对应节点证书；更新证书后需要让 Web 服务重新加载配置。
 
 ## Docker
 
-镜像、启动脚本和文档统一使用 8008 端口。密钥及本地数据不进入镜像，运行时通过环境文件和数据卷提供：
+镜像与启动脚本均读取 `HOST`、`PORT`，默认监听 `0.0.0.0:8008`。密钥及本地数据不进入镜像，运行时通过环境文件和数据卷提供：
 
 ```bash
 docker build -t mudren-rag .
 docker run --rm --env-file .env -v "<数据目录绝对路径>:/code/data" mudren-rag python scripts/sync_data.py
 docker run -d --name mudren-rag --env-file .env -p 8008:8008 -v "<数据目录绝对路径>:/code/data" mudren-rag
 ```
+
+以上端口映射适用于默认 `PORT=8008`；例如改为 `PORT=9009`，映射应为 `-p 9009:9009`（左侧可按需设为其他宿主机端口）。Dockerfile 的 `EXPOSE 8008` 仅声明默认端口，不限制实际监听。容器通常保持 `HOST=0.0.0.0`，以便通过端口映射访问。
 
 容器中的 `DB_HOST` 需指向容器可访问的数据库地址。使用以上数据卷时，请保持 `DATA_DIR=data`。
 

@@ -242,3 +242,64 @@ def test_missing_credentials_prevent_startup(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="must both be configured"):
         with TestClient(api.app):
             pass
+
+
+@pytest.mark.parametrize(("header", "seconds"), [
+    (None, 60), ("invalid", 60), ("nan", 60), ("inf", 60),
+    ("45", 45), ("1.2", 2), ("0", 1),
+])
+def test_retry_after_parsing(header, seconds):
+    assert api.retry_after_seconds(header) == seconds
+
+
+def test_retry_after_http_date():
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+    deadline = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=90), usegmt=True)
+    assert 89 <= api.retry_after_seconds(deadline) <= 90
+
+
+def test_forum_rate_limit_stops_candidate_scan_and_blocks_new_paid_calls(serving):
+    calls = []
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(429, headers={"Retry-After": "45"})
+    with serving(handler=handler, ids=tuple(range(1, 31))) as (client, embeddings, _):
+        payload = body(metadata_condition={"conditions": [{"name": "author", "comparison_operator": "is", "value": "alice"}]})
+        response = post(client, payload)
+        assert response.status_code == 503
+        assert response.json()["error_code"] == 5006
+        assert 1 <= int(response.headers["Retry-After"]) <= 45
+        requests_before = len(calls)
+        assert requests_before <= 5
+        paid_before = embeddings.embeddings.create.call_count
+        assert post(client, payload).status_code == 503
+        assert len(calls) == requests_before
+        assert embeddings.embeddings.create.call_count == paid_before
+
+
+def test_forum_recovers_after_cooldown(serving):
+    throttled = True
+    def handler(request):
+        if throttled:
+            return httpx.Response(429)
+        return thread_response(request)
+    with serving(handler=handler) as (client, _, _):
+        assert post(client).status_code == 503
+        throttled = False
+        client.app.state.forum_retry_at = 0  # Simulate expiry without waiting in tests.
+        response = post(client)
+        assert response.status_code == 200
+        assert len(response.json()["records"]) == 2
+
+
+def test_rate_limit_does_not_return_misleading_partial_ranking(serving):
+    def handler(request):
+        if request.url.path.endswith("/2"):
+            return httpx.Response(429, headers={"Retry-After": "5"})
+        return thread_response(request)
+    with serving(handler=handler, fetch_concurrency=1) as (client, _, _):
+        response = post(client)
+        assert response.status_code == 503
+        assert response.json()["error_code"] == 5006
+        assert "records" not in response.json()

@@ -1,6 +1,10 @@
 import asyncio
 import hmac
 import logging
+import math
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from contextlib import asynccontextmanager
 
 import httpx
@@ -21,10 +25,11 @@ logger = logging.getLogger(__name__)
 
 
 class APIError(Exception):
-    def __init__(self, status_code: int, error_code: int, message: str):
+    def __init__(self, status_code: int, error_code: int, message: str, headers: dict[str, str] | None = None):
         self.status_code = status_code
         self.error_code = error_code
         self.message = message
+        self.headers = headers
 
 
 @asynccontextmanager
@@ -52,6 +57,7 @@ async def lifespan(app: FastAPI):
         app.state.embeddings = embeddings
         app.state.http = http
         app.state.fetch_slots = asyncio.Semaphore(settings.fetch_concurrency)
+        app.state.forum_retry_at = 0.0
         yield
 
 
@@ -68,6 +74,7 @@ async def api_error_handler(request: Request, exc: APIError):
     return JSONResponse(
         status_code=exc.status_code,
         content={"error_code": exc.error_code, "error_msg": exc.message},
+        headers=exc.headers,
     )
 
 
@@ -83,12 +90,41 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
     )
 
 
+def retry_after_seconds(value: str | None) -> int:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        try:
+            deadline = parsedate_to_datetime(value)
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+            seconds = (deadline - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError, AttributeError):
+            seconds = 60
+    return max(1, math.ceil(seconds)) if math.isfinite(seconds) else 60
+
+
+def check_forum_cooldown(state):
+    remaining = math.ceil(state.forum_retry_at - time.monotonic())
+    if remaining > 0:
+        raise APIError(
+            503, 5006, f"论坛正文接口请求过于频繁，请在 {remaining} 秒后重试。",
+            headers={"Retry-After": str(remaining)},
+        )
+
+
 async def fetch_record(state, thread_id: int, score: float):
     """Return (record, failed). Deleted posts are skipped without upstream errors."""
     url = f"{state.settings.forum_api_base_url}/threads/{thread_id}"
     try:
         async with state.fetch_slots:
+            check_forum_cooldown(state)
             response = await state.http.get(url)
+            if response.status_code == 429:
+                delay = retry_after_seconds(response.headers.get("Retry-After"))
+                state.forum_retry_at = max(state.forum_retry_at, time.monotonic() + delay)
+                logger.warning("Forum API rate limited; pausing content requests for %s seconds.", delay)
+                check_forum_cooldown(state)
         if response.status_code in (404, 410):
             return None, False
         response.raise_for_status()
@@ -147,6 +183,7 @@ async def retrieval(request: RetrievalRequest, http_request: Request, authorizat
         raise APIError(503, 5001, "Knowledge index is unavailable.") from exc
     if snapshot.index.ntotal == 0:
         return RetrievalResponse(records=[])
+    check_forum_cooldown(state)
 
     try:
         response = await state.embeddings.embeddings.create(

@@ -49,7 +49,15 @@ def iter_threads(connection):
         while rows := cursor.fetchmany(100):
             yield from rows
     finally:
-        cursor.close()
+        interrupted = sys.exc_info()[0] is not None
+        try:
+            cursor.close()
+        except mysql.connector.Error:
+            if not interrupted:
+                raise
+            # An unbuffered result may be unread after an embedding failure.
+            # The caller closes the connection; preserve the original failure.
+            logger.debug("Interrupted cursor discarded; its connection will be closed.")
 
 
 def build_snapshot(
@@ -72,6 +80,7 @@ def build_snapshot(
     keyword_tokens = []
     seen = set()
     iterator = iter(rows)
+    batch_embeddings = True
     while batch := list(islice(iterator, BATCH_SIZE)):
         prepared = []
         for thread_id, title, markdown in batch:
@@ -102,16 +111,34 @@ def build_snapshot(
             else:
                 changed.append((position, text))
         if changed:
-            response = client.embeddings.create(
-                model=embedding_model, input=[text for _, text in changed],
-                dimensions=embedding_dimension,
-            )
-            # The provider may return items out of order. Bind by response.index.
-            items = sorted(response.data, key=lambda item: item.index)
-            if [item.index for item in items] != list(range(len(changed))):
-                raise ValueError("Embedding response count or indices do not match the requested batch.")
-            for (position, _), item in zip(changed, items):
-                vectors[position] = item.embedding
+            if batch_embeddings:
+                response = client.embeddings.create(
+                    model=embedding_model, input=[text for _, text in changed],
+                    dimensions=embedding_dimension,
+                )
+                items = response.data
+                if len(changed) > 1 and len(items) == len(changed) and all(item.index == 0 for item in items):
+                    # Some compatible endpoints label every batch item as index 0.
+                    # Never assume response order: request each text separately.
+                    logger.warning(
+                        "Embedding endpoint returned duplicate zero indices; retrying individually "
+                        "and using single-text requests for the rest of this synchronization."
+                    )
+                    batch_embeddings = False
+                else:
+                    items = sorted(items, key=lambda item: item.index)
+                    if [item.index for item in items] != list(range(len(changed))):
+                        raise ValueError("Embedding response count or indices do not match the requested batch.")
+                    for (position, _), item in zip(changed, items):
+                        vectors[position] = item.embedding
+            if not batch_embeddings:
+                for position, text in changed:
+                    response = client.embeddings.create(
+                        model=embedding_model, input=[text], dimensions=embedding_dimension,
+                    )
+                    if len(response.data) != 1 or response.data[0].index != 0:
+                        raise ValueError("Single-text embedding response count or index is invalid.")
+                    vectors[position] = response.data[0].embedding
         array = np.asarray(vectors, dtype=np.float32)
         if array.shape != (len(prepared), embedding_dimension) or not np.isfinite(array).all():
             raise ValueError("Embedding response contains invalid vectors.")
