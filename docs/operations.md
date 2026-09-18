@@ -1,6 +1,6 @@
 # 同步与接口排查操作指南
 
-本指南配合 [README](../README.md) 使用。项目不会自动创建定时任务；完成首次同步后，可按以下示例配置周期更新。Windows 路径以 `C:\AI\mudrenRAG`、Linux 路径以 `/opt/mudrenRAG` 为例，请替换为实际部署位置。
+本指南配合 [README](../README.md) 使用。Windows 的 `start_server.bat` 会自动准备虚拟环境、补齐依赖、同步一次数据并启动 API，详细步骤见 [Windows 自动启动](../README.md#windows-自动启动)。项目不会自动创建定时任务；服务持续运行期间可按以下示例配置周期更新。Windows 路径以 `C:\AI\mudrenRAG`、Linux 路径以 `/opt/mudrenRAG` 为例，请替换为实际部署位置。
 
 ## Windows 任务计划程序
 
@@ -28,7 +28,7 @@ if ($LASTEXITCODE -ne 0) { throw '同步失败，请查看上方日志。' }
 
 创建后手动运行一次任务，查看“上次运行结果”。脚本退出码为 0 表示完成（包括内容未变），1 表示失败或已有同步在运行；进一步排查可使用上面的 PowerShell 命令查看详细日志。
 
-不要将 `start_server.bat` 作为同步任务，也不需要定时重启 API。同步脚本自动读取项目根目录的 `.env`，无需在任务中另外激活虚拟环境。任务账户已有的同名环境变量会覆盖 `.env`，手动执行与计划任务结果不同的时候应检查这一点。
+周期同步任务应直接调用 `scripts/sync_data.py`。`start_server.bat` 还会检查安装依赖并启动常驻 API，不适合作为周期同步任务；更新索引无需定时重启 API。同步脚本自动读取项目根目录的 `.env`，无需在任务中另外激活虚拟环境。任务账户已有的同名环境变量会覆盖 `.env`，手动执行与计划任务结果不同的时候应检查这一点。
 
 任务的程序、参数和工作目录分别对应 [ExecAction 配置](https://learn.microsoft.com/en-us/windows/win32/taskschd/execaction)，重复执行由 [RepetitionPattern](https://learn.microsoft.com/en-us/windows/win32/taskschd/repetitionpattern) 控制。
 
@@ -127,6 +127,9 @@ unset dify_api_key
 
 | 现象 / HTTP / error_code | 含义与处理 |
 | --- | --- |
+| 自动启动停在依赖安装阶段 | 查看 pip 输出，检查包源连接及当前 Python 是否有可用依赖版本。脚本会自动补齐 pip，但不会绕过安装失败继续启动。 |
+| 自动启动提示已创建 `.env` 或配置无效 | 按中文注释填写密钥与数据库配置，替换示例占位值后重新运行；进程环境变量优先于文件。 |
+| 自动启动停在知识库同步阶段 | 检查同步日志中的数据库、向量接口或索引错误；失败会停止启动，修复后再次运行脚本。 |
 | 启动提示 `BM25 index is missing` | 旧快照没有关键词数据。先运行普通同步再启动；暂时沿用旧快照时可设置 `BM25_ENABLED=false`，向量模型和维度仍需匹配。 |
 | 启动提示模型或维度不匹配 | 确认 API 与同步脚本使用相同配置和数据目录，按当前模型运行普通同步，再重启 API。 |
 | 403 / 1001 | Authorization 头缺失或格式错误，应为 `Bearer <DIFY_API_KEY>`。 |
