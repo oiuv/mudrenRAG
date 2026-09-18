@@ -1,12 +1,14 @@
 # mudrenRAG
 
-为 Dify 提供 mud.ren 论坛内容检索的外部知识库 API。同步脚本从 MySQL 生成向量索引；检索服务使用 DashScope `text-embedding-v4` 和 FAISS 搜索，再从论坛 API 获取正文。回答生成由 Dify 完成。
+为 Dify 提供 mud.ren 论坛内容检索的外部知识库 API。同步脚本从 MySQL 生成向量与关键词索引；检索服务默认使用 DashScope `qwen3.7-text-embedding-flash` + FAISS 向量召回，以及本地 BM25 关键词召回，通过 RRF 融合并去重，从论坛 API 获取正文后，使用 `qwen3.7-text-rerank` 重排。回答生成由 Dify 完成。
 
 ## 功能
 
-- `POST /retrieval`：Bearer 鉴权、知识库 ID 校验、top_k、相似度阈值、元数据筛选。
+- `POST /retrieval`：Bearer 鉴权、知识库 ID 校验、top_k、重排得分阈值、元数据筛选。
+- 向量与重排模型、接口地址均可通过 `.env` 配置；默认开启向量 + BM25 混合检索和模型重排，每路召回窗口及重排候选上限均为 20，top_k 更大时随之扩大；实际数量受索引大小、关键词命中及筛选结果限制，最终返回不超过 top_k 条。
+- BM25 使用 BM25L 变体和 jieba 中文分词；保留英文、函数名及文件路径，并拆分 snake_case / camelCase，支持术语与代码关键词检索。关键词索引覆盖完整标题和正文。
 - 增量向量化：扫描当前可见帖子，复用内容未变的向量，只为新增和修改的帖子调用向量 API；删除、封禁和恢复可见的帖子都会在下次同步体现。
-- 同步失败时保留旧版本。索引与映射保存在单个原子替换的快照中，避免向量和帖子 ID 错配。
+- 同步失败时保留旧版本。向量、BM25 分词数据与帖子映射保存在单个原子替换的快照中，保持两路检索对应同一批内容。
 - 服务在后续请求中自动检查并加载新快照，无需重启。加载失败时继续使用上一份有效快照并记录错误。
 - 异步向量请求、正文连接复用、全局受限并发和超时控制。
 - 正文获取失败且无法返回结果时响应 HTTP 502；没有匹配结果时返回 HTTP 200 和 `{"records":[]}`。
@@ -24,20 +26,34 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-复制 `.env.example` 为 `.env`，配置：
+首次部署复制 `.env.example` 为 `.env`；已有部署按示例补充配置项，保留自己的密钥和数据库设置。进程环境变量优先于 `.env`，布尔开关接受 `true/false` 或 `1/0`。配置如下：
 
 | 配置 | 说明 |
 | --- | --- |
 | DIFY_API_KEY | Dify 请求此服务使用的密钥 |
-| DASHSCOPE_API_KEY | 阿里云 DashScope 密钥 |
+| DASHSCOPE_API_KEY | 阿里云 DashScope 密钥，向量和重排共用 |
+| EMBEDDING_MODEL | 向量模型，默认 qwen3.7-text-embedding-flash |
+| EMBEDDING_DIMENSION | 向量维度，默认 1024；默认模型支持 256、512、768、1024 |
+| EMBEDDING_BASE_URL | OpenAI 兼容向量接口地址，默认 https://dashscope.aliyuncs.com/compatible-mode/v1 |
+| RERANK_MODEL | 重排模型，默认 qwen3.7-text-rerank |
+| RERANK_API_URL | DashScope 原生重排完整 URL，默认见 .env.example |
+| RERANK_ENABLED | 默认 true；false 时按混合检索融合得分排序（同时关闭 BM25 则按向量距离） |
+| RERANK_CANDIDATES | 重排候选上限，默认 20，范围 1–500；生效上限为 max(top_k, RERANK_CANDIDATES)，关闭重排时不使用 |
+| RERANK_TIMEOUT | 重排请求的网络阶段超时秒数，默认 30，范围 (0, 120] |
+| BM25_ENABLED | 默认 true；false 时关闭关键词召回，保留向量召回及独立的重排开关 |
+| BM25_CANDIDATES | 关键词召回窗口，默认 20，范围 1–500；实际窗口计算见下文，关闭 BM25 时不使用 |
+| VECTOR_CANDIDATES | 混合检索的向量召回窗口，默认 20，范围 1–500；关闭 BM25 时不使用 |
+| RRF_K | RRF 排名平滑常数，默认 60，范围 1–1000；越大时两路共同命中的优势越明显 |
 | KNOWLEDGE_ID | 与 Dify 配置的外部知识库 ID 一致，示例为 mud-ren-forum |
 | DB_HOST / DB_PORT / DB_USER / DB_PASSWORD / DB_NAME | 论坛 MySQL，只有同步脚本使用 |
 | DATA_DIR | 数据目录，默认项目下 data，可使用绝对路径 |
 | FORUM_API_BASE_URL | 正文接口地址，默认 https://api.mud.ren |
 | FORUM_BASE_URL | 引用链接地址，默认 https://bbs.mud.ren |
-| HTTP_TIMEOUT | 单次 HTTP 网络阶段超时秒数，默认 15 |
+| HTTP_TIMEOUT | 正文 HTTP 请求的网络阶段超时秒数，默认 15，范围 (0, 120] |
 | FETCH_CONCURRENCY | 每个服务进程的正文请求并发上限，默认 5，范围 1–32 |
-| INDEX_RELOAD_INTERVAL | 请求触发的索引变更检查间隔，默认 5 秒；0 表示每次检查 |
+| INDEX_RELOAD_INTERVAL | 请求触发的索引变更检查间隔，默认 5 秒，范围 0–3600；0 表示每次检查，不是数据库同步间隔 |
+
+没有元数据筛选时，候选目标数 N 在开启重排时为 `max(top_k, RERANK_CANDIDATES)`，关闭重排时为 `top_k`。混合检索两路窗口分别取 `max(N, VECTOR_CANDIDATES)` 和 `max(N, BM25_CANDIDATES)`；关闭 BM25 时只召回 N 个向量候选。窗口受帖子总数限制，关键词命中可能少于窗口大小；开启元数据筛选时扩展到整个索引，避免筛选结果被初始窗口截断。
 
 已有部署如果没有设置 `KNOWLEDGE_ID`，继续兼容任意非空 ID，同时输出启动提示。配置后，错误的 ID 返回 HTTP 404 / error_code 2001。
 
@@ -58,9 +74,24 @@ Windows 也可以双击 `start_server.bat`，优先使用项目 `.venv`。缺少
 
 ## 同步、升级与恢复
 
-新版使用 `data/knowledge.npz` 保存 FAISS 索引、帖子映射和内容指纹。每次同步遍历数据库当前未删除、未封禁的帖子，数据库扫描量与帖子总量有关，但只为变更内容生成向量。同步进程使用文件锁，避免同时发布多个更新。
+可直接照着操作的 Windows 任务计划、Linux cron、接口自测与错误码说明见 [同步与接口排查操作指南](docs/operations.md)。
 
-旧版的 `threads.index` 和 `id_mapping.json` 可继续被服务读取。首次新版同步会重新向量化旧数据，因为旧格式没有内容指纹；成功后切换至新快照，旧文件保留。如果旧索引已经错配，应执行一次全量重建：
+新版使用 `data/knowledge.npz` 保存 FAISS 索引、BM25 分词数据及分词器版本、帖子映射、内容指纹和向量模型名称及维度。每次同步遍历数据库当前未删除、未封禁的帖子，数据库扫描量与帖子总量有关，但只为变更内容生成向量。同步进程使用文件锁，避免同时发布多个更新。
+
+升级到混合检索时，在项目虚拟环境中执行：
+
+```bash
+python -m pip install -r requirements.txt
+python scripts/sync_data.py
+```
+
+同步成功后重启 API。普通同步会补齐旧快照的 BM25 数据；向量模型、维度和内容指纹一致时复用已有向量。启用 BM25 时缺少关键词索引会明确报错；如需暂时兼容旧索引，可设置 `BM25_ENABLED=false`。之后的数据更新仍使用相同同步命令，两路索引一起发布、一起热加载。
+
+切换向量模型或维度后，运行普通同步即可自动重新生成全部向量；即使帖子内容没有变化，也不会复用不同模型的向量。切换模型或维度会触发全量向量调用；仅补齐 BM25 数据不会为可复用的帖子额外调用向量模型。API 只加载与当前配置匹配的索引；同步完成后重启服务，使新的模型配置生效。仅切换重排模型无需重建索引。
+
+旧版双文件索引被识别为 text-embedding-v4；旧版快照保留其记录的模型名称。若要暂时继续使用旧索引，请配置 `EMBEDDING_MODEL=text-embedding-v4`、`EMBEDDING_DIMENSION=1024`，并在尚未补齐 BM25 数据时设置 `BM25_ENABLED=false`。新默认模型不能直接使用旧模型索引。旧版双文件缺少内容指纹，首次新版同步会重新生成向量，即使继续使用同一模型；发布成功后旧文件仍保留。
+
+如需强制重新生成全部向量，执行：
 
 ```bash
 python scripts/sync_data.py --full
@@ -68,7 +99,9 @@ python scripts/sync_data.py --full
 
 全量重建成功前，已发布索引保持有效。任一批次失败或响应向量数量、维度异常，同步退出码为 1，不发布不完整数据；重跑会重新处理本次尚未发布的变更。普通同步遇到损坏的现有快照会明确报错，使用 `--full` 恢复。
 
-同步成功后，服务在下一次达到检查间隔的请求中加载新索引。新快照损坏时继续服务旧内存版本，`/health` 返回 `degraded`；该状态不代表外部接口健康。同步频率由部署环境的定时任务决定。
+项目没有内置定时同步器，启动 API 或执行检索请求都不会扫描 MySQL。新增、修改和删除的帖子需要手动运行同步脚本，或由 Windows 任务计划程序 / Linux cron 定期运行。定时任务应使用项目虚拟环境的 Python 和脚本绝对路径，工作目录设为项目目录；普通更新使用 `scripts/sync_data.py`，无需每次加 `--full`。`BM25_ENABLED` 只控制查询阶段，同步脚本始终生成两路索引，方便后续切换。
+
+同步成功后，服务在下一次达到检查间隔的请求中加载新索引。新快照损坏时继续服务旧内存版本，`/health` 返回 `degraded`；该状态不代表外部接口健康。数据更新只需同步并等待热加载；修改 `.env`、模型配置或应用代码后需要重启 API。
 
 ## 请求与筛选
 
@@ -95,8 +128,17 @@ python scripts/sync_data.py --full
 - `name` 为字符串；`value` 支持字符串、数字或字符串数组。无效参数返回 HTTP 422，使用顶层 `error_code` / `error_msg`。
 - 支持 Dify 文档列出的全部比较运算符。`in/not in` 使用字符串数组，数值运算使用数字，`before/after` 使用 ISO 8601 日期或时间；没有时区的时间按 UTC 解释。
 - 缺失字段只匹配 `empty`，不匹配否定运算；空条件列表不做筛选。字符串比较区分大小写。
-- 筛选会继续检查后续相似候选，直到得到 top_k 个符合条件的结果或耗尽阈值以上候选。严格条件可能导致较多正文请求，增加延迟。
-- 分数为 `1 / (1 + L2平方距离)`，不是概率。返回结果按分数降序排列。
+- 两路召回通过 RRF 按排名融合，重复帖子只保留一条，不直接相加向量距离和 BM25 原始分数。关键词没有命中时仍保留向量候选。
+- 筛选先于重排执行。有元数据条件时，扩展两路检索范围，再按融合排名检查候选，直到收集足够结果或遍历完索引；严格条件可能增加正文请求和延迟。
+- 启用重排时，返回的 score 来自重排模型，score_threshold 在重排完成后应用；向量召回阶段不使用该阈值。分数表示本次请求内的相关程度，不是概率。
+- 关闭重排且启用 BM25 时，score 为归一化 RRF 分数：`sum(1 / (RRF_K + rank)) / (2 / (RRF_K + 1))`，rank 从 1 开始，仅计算实际命中的路。取值 0–1，两路均排名第一时为 1，仅一路排名第一时为 0.5；它不是模型相似度。
+- 同时关闭 BM25 和重排时，score 为 `1 / (1 + L2平方距离)`。关闭重排时阈值在正文获取前应用；切换排序方式后需重新调整 Dify 阈值，建议先设为 0 观察召回结果。
+- 每次重排统一发送所有候选，避免混合不同请求的相对得分。每篇输入最多取标题与正文拼接后的 8192 字符，再按 120000 UTF-8 字节的保守总预算扣除每个候选对应的查询字节数并均分截断文档，每篇文档最多 30000 字节；返回给 Dify 的正文保持完整。查询过长、无法容纳指定候选数时返回 HTTP 422，可缩短查询或减少候选数。
+- 重排失败或返回非法结果时响应 HTTP 502 / error_code 5005，不静默跳过重排。没有符合最终阈值的结果时正常返回空数组。
+
+重排调用采用 DashScope 原生 `input/parameters` 请求和 `output.results` 响应格式；配置其他模型时需兼容此接口。若使用地域或业务空间专属域名，需同时配置向量与重排端点，以及对应的 API Key。修改配置后需要重启服务。
+
+接口参考：[向量化](https://help.aliyun.com/zh/model-studio/embedding)、[文本排序](https://help.aliyun.com/zh/model-studio/text-rerank-api)。
 
 协议参考：[Dify 外部知识库 API](https://docs.dify.ai/en/self-host/use-dify/knowledge/external-knowledge-api)。
 
@@ -118,13 +160,19 @@ docker run -d --name mudren-rag --env-file .env -p 8008:8008 -v "<数据目录�
 
 容器中的 `DB_HOST` 需指向容器可访问的数据库地址。使用以上数据卷时，请保持 `DATA_DIR=data`。
 
+`docker run --env-file` 使用原始 `KEY=value` 格式，会把值外围的引号作为值的一部分；示例文件已使用无外围引号的格式。旧 `.env` 用于 Docker 时需移除语法性外围引号，注释单独成行，不要改变密钥或密码本身的字符。详见 [Docker CLI 环境文件解析规则](https://github.com/docker/cli/blob/master/pkg/kvfile/kvfile.go)。
+
+已有 Docker 部署更新代码后需重新构建镜像，用新镜像执行一次同步，再替换 API 容器，并保持相同数据卷。修改 `--env-file` 后需重新创建容器以载入新值；日常数据同步只需重复上述一次性同步容器命令，API 会热加载快照。
+
 ## 验证
+
+线上联调使用 [接口自测示例](docs/operations.md#dify-接口自测)；以下命令用于运行本地自动化测试。
 
 ```bash
 python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-测试使用真实 FAISS 和本地临时文件，模拟数据库及外部 HTTP/向量服务，不需要密钥、不产生模型调用费用。
+测试使用真实 FAISS、BM25、中文分词和本地临时文件，覆盖混合召回、融合去重、关键词单路命中、筛选与阈值、同步增删改及索引迁移/热加载；模拟数据库及外部 HTTP/向量服务，不需要密钥、不产生模型调用费用。
 
-当前仍是单知识库、每篇帖子一个向量，向量输入截取标题和正文拼接后的前 8192 个字符。没有长文分块、重排序或关键词混合检索；FAISS 使用精确 L2 检索，大规模数据的内存和扫描成本需要单独评估。
+当前仍是单知识库、每篇帖子一个向量，尚无长文分块。向量输入截取标题和正文拼接后的前 8192 个字符，BM25 索引覆盖完整标题和正文。FAISS 使用精确 L2 检索，BM25 在进程内加载并扫描语料；大规模数据的内存和扫描成本需要单独评估。

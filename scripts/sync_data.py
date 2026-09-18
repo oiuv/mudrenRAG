@@ -17,8 +17,9 @@ import numpy as np
 from filelock import FileLock, Timeout
 from openai import OpenAI
 
-from app.config import EMBEDDING_DIMENSION, EMBEDDING_MODEL, MAX_TEXT_LENGTH, Settings
+from app.config import DEFAULT_EMBEDDING_DIMENSION, DEFAULT_EMBEDDING_MODEL, MAX_TEXT_LENGTH, Settings
 from app.index_store import SNAPSHOT_NAME, Snapshot, load_snapshot, save_snapshot
+from app.lexical import tokenize
 
 logger = logging.getLogger(__name__)
 BATCH_SIZE = 10
@@ -51,14 +52,24 @@ def iter_threads(connection):
         cursor.close()
 
 
-def build_snapshot(rows, client, previous: Snapshot | None = None) -> Snapshot:
-    """Reuse unchanged vectors while reflecting edits, deletions and unbans."""
+def build_snapshot(
+    rows, client, previous: Snapshot | None = None, *,
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION,
+) -> Snapshot:
+    """Reuse unchanged vectors only when model and dimensions match."""
+    if previous is not None and (
+        previous.embedding_model != embedding_model or previous.index.d != embedding_dimension
+    ):
+        logger.info("Embedding configuration changed; regenerating all vectors.")
+        previous = None
     old_positions = {
         entry["thread_id"]: (position, entry.get("source_hash"))
         for position, entry in enumerate(previous.entries)
     } if previous is not None else {}
-    index = faiss.IndexFlatL2(EMBEDDING_DIMENSION)
+    index = faiss.IndexFlatL2(embedding_dimension)
     entries = []
+    keyword_tokens = []
     seen = set()
     iterator = iter(rows)
     while batch := list(islice(iterator, BATCH_SIZE)):
@@ -73,12 +84,18 @@ def build_snapshot(rows, client, previous: Snapshot | None = None) -> Snapshot:
             digest = hashlib.sha256(
                 json.dumps([title, markdown], ensure_ascii=False).encode("utf-8")
             ).hexdigest()
-            prepared.append((thread_id, digest, f"标题：{title}\n内容：{markdown}"[:MAX_TEXT_LENGTH]))
+            old = old_positions.get(thread_id)
+            if old is not None and old[1] == digest and previous.keyword_tokens is not None:
+                tokens = previous.keyword_tokens[old[0]]
+            else:
+                # Lexical retrieval covers the complete text, including beyond the embedding prefix.
+                tokens = tokenize(f"{title}\n{markdown}")
+            prepared.append((thread_id, digest, f"标题：{title}\n内容：{markdown}"[:MAX_TEXT_LENGTH], tokens))
         if not prepared:
             continue
         vectors = [None] * len(prepared)
         changed = []
-        for position, (thread_id, digest, text) in enumerate(prepared):
+        for position, (thread_id, digest, text, _) in enumerate(prepared):
             old = old_positions.get(thread_id)
             if old is not None and old[1] == digest:
                 vectors[position] = previous.index.reconstruct(old[0])
@@ -86,8 +103,8 @@ def build_snapshot(rows, client, previous: Snapshot | None = None) -> Snapshot:
                 changed.append((position, text))
         if changed:
             response = client.embeddings.create(
-                model=EMBEDDING_MODEL, input=[text for _, text in changed],
-                dimensions=EMBEDDING_DIMENSION,
+                model=embedding_model, input=[text for _, text in changed],
+                dimensions=embedding_dimension,
             )
             # The provider may return items out of order. Bind by response.index.
             items = sorted(response.data, key=lambda item: item.index)
@@ -96,12 +113,13 @@ def build_snapshot(rows, client, previous: Snapshot | None = None) -> Snapshot:
             for (position, _), item in zip(changed, items):
                 vectors[position] = item.embedding
         array = np.asarray(vectors, dtype=np.float32)
-        if array.shape != (len(prepared), EMBEDDING_DIMENSION) or not np.isfinite(array).all():
+        if array.shape != (len(prepared), embedding_dimension) or not np.isfinite(array).all():
             raise ValueError("Embedding response contains invalid vectors.")
         index.add(array)
-        entries.extend({"thread_id": thread_id, "source_hash": digest} for thread_id, digest, _ in prepared)
+        entries.extend({"thread_id": thread_id, "source_hash": digest} for thread_id, digest, _, _ in prepared)
+        keyword_tokens.extend(tokens for _, _, _, tokens in prepared)
         logger.info("Processed %s threads (%s embeddings generated in this batch).", len(entries), len(changed))
-    return Snapshot(index, entries)
+    return Snapshot(index, entries, embedding_model, keyword_tokens)
 
 
 def synchronize(settings: Settings, full: bool = False):
@@ -114,22 +132,31 @@ def synchronize(settings: Settings, full: bool = False):
         has_legacy = all((settings.data_dir / name).exists() for name in ("threads.index", "id_mapping.json"))
         if not full and (has_snapshot or has_legacy):
             # Corrupt existing data must be explicitly rebuilt, never silently replaced.
-            previous = load_snapshot(settings.data_dir)
+            previous = load_snapshot(settings.data_dir, embedding_model=None, embedding_dimension=None)
         connection = get_db_connection()
         rows = iter_threads(connection)
         try:
             with OpenAI(
                 api_key=settings.dashscope_api_key,
-                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                base_url=settings.embedding_base_url,
                 timeout=30.0, max_retries=2,
             ) as client:
-                snapshot = build_snapshot(rows, client, previous)
+                snapshot = build_snapshot(
+                    rows, client, previous,
+                    embedding_model=settings.embedding_model,
+                    embedding_dimension=settings.embedding_dimension,
+                )
         finally:
             try:
                 rows.close()
             finally:
                 connection.close()
-        if previous is not None and snapshot.entries == previous.entries and has_snapshot:
+        if (
+            previous is not None and has_snapshot and snapshot.entries == previous.entries
+            and snapshot.embedding_model == previous.embedding_model
+            and snapshot.index.d == previous.index.d
+            and snapshot.keyword_tokens == previous.keyword_tokens
+        ):
             logger.info("No content changes; existing snapshot retained.")
             return
         save_snapshot(settings.data_dir, snapshot)

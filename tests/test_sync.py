@@ -20,7 +20,7 @@ def embedding_client(fail_on=None):
             raise RuntimeError("simulated failed embedding batch")
         # Reverse response order to exercise response.index binding.
         return NS(data=[
-            NS(index=i, embedding=vector(float(text.split("标题：")[1].split("\n")[0])))
+            NS(index=i, embedding=vector(float(text.split("标题：")[1].split("\n")[0]), kwargs["dimensions"]))
             for i, text in reversed(list(enumerate(kwargs["input"])))
         ])
 
@@ -119,3 +119,93 @@ def test_streaming_query_uses_parameters_and_closes_cursor():
     assert "deleted_at IS NULL" in sql and "banned_at IS NULL" in sql
     assert params == ("App\\Thread",)
     cursor.close.assert_called_once()
+
+
+def test_model_or_dimension_change_reembeds_unchanged_content():
+    client, calls = embedding_client()
+    rows = [(1, "1", "unchanged")]
+    old = sync.build_snapshot(rows, client, embedding_model="text-embedding-v4")
+    changed = sync.build_snapshot(rows, client, old, embedding_model="custom-embedding", embedding_dimension=256)
+    assert len(calls) == 2
+    assert changed.embedding_model == "custom-embedding"
+    assert changed.index.d == 256
+    assert changed.entries == old.entries
+    kwargs = client.embeddings.create.call_args.kwargs
+    assert kwargs["model"] == "custom-embedding" and kwargs["dimensions"] == 256
+
+
+def test_model_migration_is_published_even_when_content_hashes_match(tmp_path, monkeypatch):
+    from app.config import DEFAULT_EMBEDDING_MODEL
+    client, calls = embedding_client()
+    rows = [(1, "1", "unchanged")]
+    old = sync.build_snapshot(rows, client, embedding_model="text-embedding-v4")
+    save_snapshot(tmp_path, old)
+    connection = Mock()
+    monkeypatch.setattr(sync, "get_db_connection", lambda: connection)
+    monkeypatch.setattr(sync, "iter_threads", lambda connection: (row for row in rows))
+    monkeypatch.setattr(sync, "OpenAI", lambda **kwargs: client)
+    sync.synchronize(Settings("test", "test", tmp_path))
+    migrated = load_snapshot(tmp_path)
+    assert migrated.embedding_model == DEFAULT_EMBEDDING_MODEL
+    assert migrated.entries == old.entries
+    assert len(calls) == 2
+
+
+def test_failed_model_migration_keeps_original_snapshot(tmp_path, monkeypatch):
+    client, _ = embedding_client()
+    rows = [(1, "1", "unchanged")]
+    old = sync.build_snapshot(rows, client, embedding_model="text-embedding-v4")
+    save_snapshot(tmp_path, old)
+    before = (tmp_path / SNAPSHOT_NAME).read_bytes()
+    failing_client, _ = embedding_client(fail_on=1)
+    monkeypatch.setattr(sync, "get_db_connection", Mock())
+    monkeypatch.setattr(sync, "iter_threads", lambda connection: (row for row in rows))
+    monkeypatch.setattr(sync, "OpenAI", lambda **kwargs: failing_client)
+    with pytest.raises(RuntimeError, match="failed embedding"):
+        sync.synchronize(Settings("test", "test", tmp_path))
+    assert (tmp_path / SNAPSHOT_NAME).read_bytes() == before
+    assert load_snapshot(tmp_path, embedding_model="text-embedding-v4").embedding_model == "text-embedding-v4"
+
+
+def test_bm25_migration_reuses_embeddings_and_publishes_new_snapshot(tmp_path, monkeypatch):
+    from app.index_store import Snapshot
+    rows = [(1, "1", "query_temp")]
+    client, calls = embedding_client()
+    previous = sync.build_snapshot(rows, client)
+    # Simulate a version-2 snapshot with fingerprints but no lexical corpus.
+    save_snapshot(tmp_path, Snapshot(previous.index, previous.entries, previous.embedding_model))
+    monkeypatch.setattr(sync, "get_db_connection", Mock())
+    monkeypatch.setattr(sync, "iter_threads", lambda connection: (row for row in rows))
+    monkeypatch.setattr(sync, "OpenAI", lambda **kwargs: client)
+    sync.synchronize(Settings("test", "test", tmp_path))
+    migrated = load_snapshot(tmp_path)
+    assert len(calls) == 1  # No additional embedding request during BM25 migration.
+    assert migrated.keyword_tokens is not None
+    assert migrated.keyword_index.search("query_temp", 1)[0][0] == 0
+    assert migrated.entries == previous.entries
+
+
+def test_keyword_index_tracks_edits_deletions_and_restoration():
+    client, _ = embedding_client()
+    old = sync.build_snapshot([(1, "1", "oldkeyword"), (2, "2", "deletedword")], client)
+    updated = sync.build_snapshot([(1, "1", "newkeyword")], client, old)
+    assert updated.keyword_index.search("oldkeyword", 10) == []
+    assert updated.keyword_index.search("deletedword", 10) == []
+    assert updated.keyword_index.search("newkeyword", 10)[0][0] == 0
+    restored = sync.build_snapshot([(1, "1", "newkeyword"), (2, "2", "deletedword")], client, updated)
+    position = restored.keyword_index.search("deletedword", 1)[0][0]
+    assert restored.entries[position]["thread_id"] == 2
+
+
+def test_keyword_index_covers_text_beyond_embedding_truncation():
+    client, calls = embedding_client()
+    result = sync.build_snapshot([(1, "1", "padding " * 2000 + "rare_tail_identifier")], client)
+    assert "rare_tail_identifier" not in calls[0][0]
+    assert result.keyword_index.search("rare_tail_identifier", 1)[0][0] == 0
+
+
+def test_empty_database_publishes_empty_lexical_corpus():
+    client, _ = embedding_client()
+    result = sync.build_snapshot([], client)
+    assert result.keyword_tokens == []
+    assert result.keyword_index.search("anything", 10) == []

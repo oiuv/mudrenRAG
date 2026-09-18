@@ -48,13 +48,17 @@ class FakeEmbeddingClient:
 @pytest.fixture
 def serving(tmp_path, monkeypatch):
     @contextmanager
-    def run(handler=thread_response, ids=(1, 2, 3), **overrides):
+    def run(handler=thread_response, ids=(1, 2, 3), keyword_texts=None, vector_values=None, **overrides):
         settings = replace(
-            Settings("test-key", "test-dashscope", tmp_path, knowledge_id="forum", index_reload_interval=0),
+            Settings("test-key", "test-dashscope", tmp_path, knowledge_id="forum", index_reload_interval=0, rerank_enabled=False, bm25_enabled=False),
             **overrides,
         )
-        save_snapshot(tmp_path, snapshot(ids))
+        save_snapshot(tmp_path, snapshot(
+            ids, values=vector_values, model=settings.embedding_model,
+            dimension=settings.embedding_dimension, keyword_texts=keyword_texts,
+        ))
         embeddings = FakeEmbeddingClient()
+        embeddings.embeddings.create.return_value = NS(data=[NS(embedding=vector(dimension=settings.embedding_dimension).tolist())])
         monkeypatch.setattr(api.Settings, "from_env", classmethod(lambda cls: settings))
         monkeypatch.setattr(api, "AsyncOpenAI", lambda **kwargs: embeddings)
         monkeypatch.setattr(

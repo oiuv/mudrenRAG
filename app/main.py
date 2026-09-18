@@ -10,10 +10,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from openai import AsyncOpenAI
 
-from .config import EMBEDDING_DIMENSION, EMBEDDING_MODEL, Settings
+from .config import Settings
 from .index_store import IndexStore
 from .metadata import matches_metadata
 from .models import ErrorResponse, Record, RetrievalRequest, RetrievalResponse
+from .rerank import RerankInputError, rerank_records
+from .retrieval import retrieve_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -30,13 +32,16 @@ async def lifespan(app: FastAPI):
     settings = Settings.from_env()
     if not settings.dify_api_key or not settings.dashscope_api_key:
         raise RuntimeError("DIFY_API_KEY and DASHSCOPE_API_KEY must both be configured.")
-    store = IndexStore(settings.data_dir, settings.index_reload_interval)
+    store = IndexStore(
+        settings.data_dir, settings.index_reload_interval,
+        settings.embedding_model, settings.embedding_dimension, bm25_enabled=settings.bm25_enabled,
+    )
     await asyncio.to_thread(store.get_snapshot)
     if not settings.knowledge_id:
         logger.warning("KNOWLEDGE_ID is unset; accepting any knowledge_id for legacy compatibility.")
     async with AsyncOpenAI(
         api_key=settings.dashscope_api_key,
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        base_url=settings.embedding_base_url,
         timeout=30.0, max_retries=2,
     ) as embeddings, httpx.AsyncClient(
         timeout=httpx.Timeout(settings.http_timeout),
@@ -53,7 +58,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="mudrenRAG Retrieval Service for Dify",
     description="External knowledge retrieval for forum posts.",
-    version="1.1.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -145,31 +150,31 @@ async def retrieval(request: RetrievalRequest, http_request: Request, authorizat
 
     try:
         response = await state.embeddings.embeddings.create(
-            model=EMBEDDING_MODEL, input=request.query, dimensions=EMBEDDING_DIMENSION,
+            model=settings.embedding_model, input=request.query, dimensions=settings.embedding_dimension,
         )
         query = np.asarray([response.data[0].embedding], dtype=np.float32)
-        if query.shape != (1, EMBEDDING_DIMENSION) or not np.isfinite(query).all():
+        if query.shape != (1, settings.embedding_dimension) or not np.isfinite(query).all():
             raise ValueError("Invalid query embedding.")
     except Exception as exc:
         logger.exception("Query embedding failed.")
         raise APIError(502, 5002, "Failed to vectorize query; check the embedding service.") from exc
 
-    # Filtering must happen before limiting the final records to top_k.
+    # Collect a larger candidate set before reranking; apply final score thresholds afterward.
+    top_k = request.retrieval_setting.top_k
+    candidate_limit = max(top_k, settings.rerank_candidates) if settings.rerank_enabled else top_k
     filtering = bool(request.metadata_condition and request.metadata_condition.conditions)
-    count = snapshot.index.ntotal if filtering else min(request.retrieval_setting.top_k, snapshot.index.ntotal)
     try:
-        distances, indices = await asyncio.to_thread(snapshot.index.search, query, count)
+        candidates = await asyncio.to_thread(
+            retrieve_candidates, snapshot, query, request.query, settings, candidate_limit, filtering,
+        )
     except Exception as exc:
-        logger.exception("Vector search failed.")
+        logger.exception("Knowledge search failed.")
         raise APIError(503, 5004, "Knowledge index search failed.") from exc
-    candidates = []
-    for position, distance in zip(indices[0], distances[0]):
-        if position < 0 or not np.isfinite(distance):
-            continue
-        score = 1.0 / (1.0 + max(0.0, float(distance)))
-        if score < request.retrieval_setting.score_threshold:
-            break
-        candidates.append((snapshot.entries[int(position)]["thread_id"], score))
+    if not settings.rerank_enabled:
+        candidates = [
+            (thread_id, score) for thread_id, score in candidates
+            if score >= request.retrieval_setting.score_threshold
+        ]
 
     records, failures = [], 0
     batch_size = settings.fetch_concurrency
@@ -182,11 +187,21 @@ async def retrieval(request: RetrievalRequest, http_request: Request, authorizat
             failures += int(failed)
             if record is not None and matches_metadata(record.metadata, request.metadata_condition):
                 records.append(record)
-        if len(records) >= request.retrieval_setting.top_k:
+        if len(records) >= candidate_limit:
             break
     if failures and not records:
         raise APIError(
             502, 5003,
             "Forum content could not be retrieved. Check the forum API, HTTPS certificate and server logs.",
         )
-    return RetrievalResponse(records=records[:request.retrieval_setting.top_k])
+    records = records[:candidate_limit]
+    if settings.rerank_enabled and records:
+        try:
+            records = await rerank_records(state.http, settings, request.query, records, top_k)
+        except RerankInputError as exc:
+            raise APIError(422, 1003, str(exc)) from exc
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            logger.warning("Reranking failed with model %s: %s", settings.rerank_model, exc)
+            raise APIError(502, 5005, "Reranking failed; check the rerank model, endpoint and server logs.") from exc
+        records = [record for record in records if record.score >= request.retrieval_setting.score_threshold]
+    return RetrievalResponse(records=records[:top_k])
